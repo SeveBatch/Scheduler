@@ -1,0 +1,28 @@
+name: Update schedule.ics
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: go run sched.go -team "Jedi Knights" -out schedule.ics
+      - name: Commit if changed
+        run: |
+          if [[ -n "$(git status --porcelain schedule.ics)" ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add schedule.ics
+            git commit -m "Update schedule.ics"
+            git push
+          fi
