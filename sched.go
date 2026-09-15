@@ -1,7 +1,8 @@
-// schedgen reads a GameSheet schedule (from the public API or a CSV export)
-// and writes an ICS calendar file.
+// schedgen reads a GameSheet team schedule (the schedule web page, a saved
+// copy of that page, or a CSV export) and writes an ICS calendar file.
 //
-//	go run . -mode url -out schedule.ics
+//	go run . -mode url -url https://gamesheetstats.com/seasons/15870/teams/560065/schedule -team "Skateful Dead" -out season/2026/winter/team/skateful-dead.ics
+//	go run . -mode html -in skateful-dead.html -team "Skateful Dead" -out season/2026/winter/team/skateful-dead.ics
 //	go run . -mode csv -in temp.csv -out schedule.ics
 package main
 
@@ -22,7 +23,7 @@ import (
 const (
 	tzName     = "America/Denver"
 	duration   = 90 * time.Minute
-	defaultURL = "https://gamesheetstats.com/api/useUnifiedGames/14869?filter[gametype]=overall&filter[limit]=100&filter[offset]=0&filter[teams]=511656&filter[timeZoneOffset]=-360"
+	defaultURL = "https://gamesheetstats.com/seasons/14869/teams/511656/schedule"
 )
 
 type Game struct {
@@ -31,9 +32,9 @@ type Game struct {
 }
 
 func main() {
-	mode := flag.String("mode", "url", "input mode: 'url' (fetch from GameSheet API) or 'csv' (read local CSV export)")
-	url := flag.String("url", defaultURL, "GameSheet useUnifiedGames API URL (used when -mode=url)")
-	in := flag.String("in", "temp.csv", "input CSV from GameSheet export (used when -mode=csv)")
+	mode := flag.String("mode", "url", "input mode: 'url' (fetch the GameSheet schedule page), 'html' (read a saved copy of that page), or 'csv' (read a GameSheet CSV export)")
+	url := flag.String("url", defaultURL, "GameSheet team schedule page URL (used when -mode=url)")
+	in := flag.String("in", "temp.csv", "input file: saved schedule page (-mode=html) or CSV export (-mode=csv)")
 	out := flag.String("out", "schedule.ics", "output ICS file path")
 	team := flag.String("team", "", "filter to games involving this team (case-insensitive); home games render as 'Team vs Opponent'")
 	flag.Parse()
@@ -47,11 +48,14 @@ func main() {
 	case "url":
 		src = *url
 		games, err = fetchGames(*url, loc, *team)
+	case "html":
+		src = *in
+		games, err = readPage(*in, loc, *team)
 	case "csv":
 		src = *in
 		games, err = readGames(*in, loc, *team)
 	default:
-		must(fmt.Errorf("invalid -mode %q (want 'url' or 'csv')", *mode))
+		must(fmt.Errorf("invalid -mode %q (want 'url', 'html' or 'csv')", *mode))
 	}
 	must(err)
 	if len(games) == 0 {
@@ -62,54 +66,122 @@ func main() {
 	fmt.Printf("Wrote %s (%d games)\n", *out, len(games))
 }
 
-// fetchGames retrieves games from the GameSheet API. The response is columnar:
-// parallel arrays where index i across each describes one game.
-// GameSheet tags wall-clock local times with a Z suffix; we reinterpret them in loc.
+// fetchGames downloads the team schedule page and parses it.
+// Note: gamesheetstats.com sits behind a Cloudflare browser check, which
+// usually rejects plain HTTP clients with a 403. Use -mode html with a page
+// saved from a browser when that happens.
 func fetchGames(url string, loc *time.Location, team string) ([]Game, error) {
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GET %s: %d %s", url, resp.StatusCode, string(body))
+		msg := string(body)
+		if strings.Contains(msg, "Just a moment") {
+			msg = "blocked by Cloudflare browser check; save the page from a browser and use -mode html"
+		}
+		return nil, fmt.Errorf("GET %s: %d %s", url, resp.StatusCode, msg)
+	}
+	return parsePage(body, loc, team)
+}
+
+// readPage parses a schedule page saved from a browser (File > Save Page As).
+func readPage(path string, loc *time.Location, team string) ([]Game, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parsePage(body, loc, team)
+}
+
+// parsePage extracts games from the schedule page HTML. The page is a Next.js
+// app that streams its data as a series of
+//
+//	self.__next_f.push([1,"<json string>"])
+//
+// script chunks. Joined together, the strings contain a row like
+// 19:[{"gameId":...},...] holding the schedule. Rows can be split across chunks,
+// so all chunks are decoded and concatenated before searching.
+func parsePage(html []byte, loc *time.Location, team string) ([]Game, error) {
+	const marker = `self.__next_f.push([1,`
+	var payload strings.Builder
+	rest := string(html)
+	for {
+		i := strings.Index(rest, marker)
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len(marker):]
+		lit, n := jsonStringLiteral(rest)
+		if n == 0 {
+			return nil, fmt.Errorf("malformed __next_f chunk")
+		}
+		var s string
+		if err := json.Unmarshal([]byte(lit), &s); err != nil {
+			return nil, fmt.Errorf("decode __next_f chunk: %w", err)
+		}
+		payload.WriteString(s)
+		rest = rest[n:]
 	}
 
-	var data struct {
-		Date     []string                 `json:"date"`
-		Visitor  []struct{ Title string } `json:"visitor"`
-		Home     []struct{ Title string } `json:"home"`
-		Location []string                 `json:"location"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+	const gamesKey = `[{"gameId":`
+	text := payload.String()
+	i := strings.Index(text, gamesKey)
+	if i < 0 {
+		return nil, fmt.Errorf("no game list found in page (is this a GameSheet team schedule page?)")
 	}
 
-	n := len(data.Date)
-	if len(data.Visitor) != n || len(data.Home) != n || len(data.Location) != n {
-		return nil, fmt.Errorf("inconsistent array lengths: date=%d visitor=%d home=%d location=%d",
-			n, len(data.Visitor), len(data.Home), len(data.Location))
+	var rows []struct {
+		TimeStampZulu string                 `json:"timeStampZulu"`
+		Location      string                 `json:"location"`
+		Visitor       struct{ Title string } `json:"visitor"`
+		Home          struct{ Title string } `json:"home"`
+	}
+	if err := json.NewDecoder(strings.NewReader(text[i:])).Decode(&rows); err != nil {
+		return nil, fmt.Errorf("decode game list: %w", err)
 	}
 
 	var games []Game
-	for i := 0; i < n; i++ {
-		t, err := time.Parse("2006-01-02T15:04:05.000Z", data.Date[i])
+	for n, r := range rows {
+		t, err := time.Parse(time.RFC3339, r.TimeStampZulu)
 		if err != nil {
-			return nil, fmt.Errorf("game %d: parse date %q: %w", i, data.Date[i], err)
+			return nil, fmt.Errorf("game %d: parse timeStampZulu %q: %w", n, r.TimeStampZulu, err)
 		}
-		visitor, home := data.Visitor[i].Title, data.Home[i].Title
+		visitor, home := r.Visitor.Title, r.Home.Title
 		if team != "" && !strings.EqualFold(visitor, team) && !strings.EqualFold(home, team) {
 			continue
 		}
 		games = append(games, Game{
-			Start:    time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, loc),
+			Start:    t.In(loc),
 			Visitor:  visitor,
 			Home:     home,
-			Location: data.Location[i],
+			Location: r.Location,
 		})
 	}
 	return games, nil
+}
+
+// jsonStringLiteral returns the JSON string literal (quotes included) at the
+// start of s, and the number of bytes it spans. n is 0 if s does not start
+// with a complete string literal.
+func jsonStringLiteral(s string) (lit string, n int) {
+	if len(s) == 0 || s[0] != '"' {
+		return "", 0
+	}
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return s[:i+1], i + 1
+		}
+	}
+	return "", 0
 }
 
 func subject(g Game, team string) string {
@@ -204,7 +276,11 @@ func writeICS(path string, games []Game, team string) error {
 	w("PRODID:-//schedgen//EN")
 	w("CALSCALE:GREGORIAN")
 	w("METHOD:PUBLISH")
-	w("X-WR-CALNAME:Hockey Schedule")
+	calName := "Hockey Schedule"
+	if team != "" {
+		calName = team + " Schedule"
+	}
+	w("X-WR-CALNAME:" + escape(calName))
 	w("X-WR-TIMEZONE:" + tzName)
 	w("BEGIN:VTIMEZONE")
 	w("TZID:" + tzName)
